@@ -22,7 +22,13 @@ Créditos:
 import sys, os, subprocess, json, pathlib
 
 _MARKER = pathlib.Path.home() / ".ipscan_deps_installed"
-_DEPS_VERSION = "2"   # incremente para forçar reinstalação futura
+_DEPS_VERSION = "3"   # incremente para forçar reinstalação futura
+
+# ── versão atual do app (usada também na verificação de updates) ──────────────
+APP_VERSION = "2.1"
+GITHUB_REPO = "ricinuss/ipscanner"
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_REPO_URL = f"https://github.com/{GITHUB_REPO}/tree/main"
 
 def _run(cmd, **kw):
     return subprocess.run(cmd, **kw)
@@ -31,7 +37,6 @@ def _detect_distro():
     """Retorna ('debian'|'redhat'|'arch'|'suse'|'unknown', pkg_manager)"""
     if pathlib.Path("/etc/debian_version").exists():
         mgr = "apt-get"
-        _run(["which","nala"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if _run(["which","nala"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
             mgr = "nala"
         return "debian", mgr
@@ -46,7 +51,8 @@ def _detect_distro():
     return "unknown", ""
 
 def _pip_install(*pkgs):
-    _run([sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", *pkgs])
+    _run([sys.executable, "-m", "pip", "install", "--quiet",
+          "--break-system-packages", "--root-user-action=ignore", *pkgs])
 
 def _install_nmap_bin(distro, mgr):
     try:
@@ -75,6 +81,31 @@ def _already_installed():
 def _mark_installed():
     _MARKER.write_text(json.dumps({"version": _DEPS_VERSION}))
 
+def _update_mac_vendors_with_timeout(timeout_sec=15):
+    """
+    Atualiza a base de MACs com timeout — evita travamento indefinido.
+    Roda em thread separada com join(timeout).
+    """
+    import threading
+    result = {"ok": False, "msg": ""}
+
+    def _do_update():
+        try:
+            from mac_vendor_lookup import MacLookup
+            MacLookup().update_vendors()
+            result["ok"]  = True
+            result["msg"] = "✔ Base de fabricantes atualizada."
+        except Exception as e:
+            result["ok"]  = False
+            result["msg"] = f"⚠ Não foi possível atualizar a base de fabricantes: {e}"
+
+    t = threading.Thread(target=_do_update, daemon=True)
+    t.start()
+    t.join(timeout_sec)
+    if t.is_alive():
+        return False, f"⚠ Atualização da base de MACs expirou após {timeout_sec}s (sem internet?). Continuando com base local."
+    return result["ok"], result["msg"]
+
 def _run_installer_window():
     """Exibe janela de instalação Tkinter (básico, sem dependências externas)."""
     import tkinter as tk
@@ -86,7 +117,6 @@ def _run_installer_window():
     root.resizable(False, False)
     root.configure(bg="#1a1d23")
 
-    # ícone/header
     tk.Label(root, text="🔍  Advanced IP Scanner",
              bg="#1a1d23", fg="#4fc3f7",
              font=("monospace", 15, "bold")).pack(pady=(28,4))
@@ -153,14 +183,11 @@ def _run_installer_window():
         except Exception as e:
             log(f"⚠ Erro ao instalar mac-vendor-lookup: {e}")
 
-        # atualiza base de MACs
-        log("► Atualizando base de dados de fabricantes (MAC)…")
-        try:
-            from mac_vendor_lookup import MacLookup
-            MacLookup().update_vendors()
-            log("✔ Base de fabricantes atualizada.")
-        except Exception:
-            log("⚠ Não foi possível atualizar a base de fabricantes (sem internet?).")
+        # atualiza base de MACs com timeout
+        status_var.set("Atualizando base de fabricantes (MAC)…")
+        log("► Atualizando base de dados de fabricantes (timeout: 15s)…")
+        ok, msg = _update_mac_vendors_with_timeout(timeout_sec=15)
+        log(msg)
 
         _mark_installed()
         pbar.stop()
@@ -176,11 +203,11 @@ if not _already_installed():
     try:
         _run_installer_window()
     except Exception as e:
-        # fallback silencioso para ambientes sem display
         print(f"[Instalador] {e}. Tentando instalar dependências em modo silencioso…")
         distro, mgr = _detect_distro()
         _install_nmap_bin(distro, mgr)
         _pip_install("python-nmap", "mac-vendor-lookup")
+        _update_mac_vendors_with_timeout(timeout_sec=15)
         _mark_installed()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -191,6 +218,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import queue
+import urllib.request
+import urllib.error
 
 try:
     import nmap as nmap_lib
@@ -209,7 +238,6 @@ except Exception:
 #  CONSTANTES / PALETA
 # ══════════════════════════════════════════════════════════════════════════════
 APP_TITLE   = "Advanced IP Scanner"
-APP_VERSION = "2.0"
 APP_AUTHOR  = "ricinus"
 
 BG_DARK     = "#1a1d23"
@@ -292,6 +320,43 @@ DEVICE_HINTS = [
     (r"(?i)(lenovo)",                                    "💻", "Lenovo",                   FG_PRIMARY),
     (r"(?i)(apple|macbook|imac)",                        "🍎", "Apple Mac",               FG_PRIMARY),
 ]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  VERIFICAÇÃO DE ATUALIZAÇÕES (GitHub)
+# ══════════════════════════════════════════════════════════════════════════════
+def check_for_updates(timeout=8):
+    """
+    Verifica a última release no GitHub.
+    Retorna (has_update: bool, latest_version: str, url: str, error: str|None)
+    """
+    try:
+        req = urllib.request.Request(
+            GITHUB_API_URL,
+            headers={"User-Agent": f"AdvancedIPScanner/{APP_VERSION}",
+                     "Accept": "application/vnd.github.v3+json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        latest = data.get("tag_name", "").lstrip("v")
+        url    = data.get("html_url", GITHUB_REPO_URL)
+        if not latest:
+            # sem releases ainda — aponta direto para o repositório
+            return False, APP_VERSION, GITHUB_REPO_URL, "Nenhuma release encontrada no repositório."
+        has_update = _version_gt(latest, APP_VERSION)
+        return has_update, latest, url, None
+    except urllib.error.URLError as e:
+        return False, APP_VERSION, GITHUB_REPO_URL, f"Sem conexão: {e.reason}"
+    except Exception as e:
+        return False, APP_VERSION, GITHUB_REPO_URL, str(e)
+
+def _version_gt(v1, v2):
+    """Retorna True se v1 > v2 (comparação numérica de partes separadas por ponto)."""
+    try:
+        def parts(v):
+            return [int(x) for x in re.split(r"[.\-]", v) if x.isdigit()]
+        return parts(v1) > parts(v2)
+    except Exception:
+        return v1 != v2
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MODELO DE DADOS
@@ -422,10 +487,10 @@ def nmap_scan_full(ip):
                 svc = h[proto][port]
                 if svc["state"] != "open":
                     continue
-                sname   = svc.get("name","")
-                product = svc.get("product","")
-                version = svc.get("version","")
-                extrainfo = svc.get("extrainfo","")
+                sname      = svc.get("name","")
+                product    = svc.get("product","")
+                version    = svc.get("version","")
+                extrainfo  = svc.get("extrainfo","")
                 parts = [x for x in [product, version, extrainfo] if x]
                 label = " ".join(parts) or sname
                 icon, scheme = "🔌", ""
@@ -484,7 +549,7 @@ def scan_device(ip, advanced=False, stop_event=None):
     return dev
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  JANELA DE AJUDA
+#  TEXTOS DE AJUDA
 # ══════════════════════════════════════════════════════════════════════════════
 HELP_TEXT = """
 ╔══════════════════════════════════════════════════════════════════╗
@@ -539,6 +604,17 @@ HELP_TEXT = """
    sudo python3 ip_scanner_gui.py
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ VERIFICAÇÃO DE ATUALIZAÇÕES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ Acesse Ajuda → Verificar atualizações para checar se há uma
+ versão mais nova disponível no GitHub. Se houver, um link
+ para download será exibido.
+
+ O programa também verifica automaticamente ao iniciar
+ (em background, sem bloquear a interface).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  INTERAGINDO COM OS RESULTADOS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -560,8 +636,6 @@ HELP_TEXT = """
  • Clique nos cabeçalhos das colunas → ordena a tabela por aquela
    coluna (IP, Nome, Fabricante, etc.)
 
- • Links no painel de detalhes são clicáveis (cursor vira 🖱️ mão).
-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  EXPORTAR RESULTADOS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -569,24 +643,6 @@ HELP_TEXT = """
  Acesse Arquivo → Exportar resultados (CSV)…
  O arquivo CSV pode ser aberto no LibreOffice Calc, Excel, etc.
  Contém: IP, Hostname, MAC, Fabricante, Tipo, SO, Ping, Serviços.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- FORMATOS DE REDE ACEITOS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-   192.168.1.0/24    → 254 hosts  (rede /24 padrão)
-   192.168.0.0/23    → 510 hosts  (duas sub-redes)
-   10.0.0.0/16       → 65534 hosts (rede grande — use mais threads!)
-   172.16.0.0/24     → 254 hosts  (rede privada classe B)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- SERVIÇOS DETECTADOS AUTOMATICAMENTE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-   🗂️  FTP  (21)       🔐 SSH  (22)       📟 Telnet (23)
-   🌐  HTTP (80)       🔒 HTTPS (443)     🪟  SMB  (445)
-   🖨️  IPP  (631)      🖥️  RDP  (3389)    🖥️  VNC  (5900)
-   🌐  HTTP-Alt (8080) 🔒 HTTPS-Alt (8443) 🖨️ Print (9100)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  DICAS E SOLUÇÃO DE PROBLEMAS
@@ -599,12 +655,6 @@ HELP_TEXT = """
    "Rede" está correta. Use `ip route` no terminal para confirmar.
 
  • Scan avançado travando → aumente o timeout ou reduza threads.
-   Alguns firewalls bloqueiam o nmap silenciosamente.
-
- • "nmap não instalado" → reinstale as dependências:
-   sudo apt install nmap   (Debian/Ubuntu)
-   sudo dnf install nmap   (Fedora/RHEL)
-   sudo pacman -S nmap     (Arch)
 
  • Para reinstalar as dependências Python do zero, delete o arquivo:
    ~/.ipscan_deps_installed   e reinicie o programa.
@@ -616,57 +666,6 @@ HELP_TEXT = """
  ⚠ Este programa deve ser usado APENAS em redes que você tem
    autorização para analisar (sua própria rede, redes de clientes
    com contrato, ambientes de laboratório/teste).
-
- Escanear redes de terceiros sem autorização pode ser ilegal
- dependendo da legislação do seu país.
-"""
-
-ABOUT_TEXT = f"""
-╔══════════════════════════════════════════════════════════════╗
-║              Advanced IP Scanner {APP_VERSION} — Linux                ║
-╚══════════════════════════════════════════════════════════════╝
-
-  Clone do Advanced IP Scanner para Linux, desenvolvido
-  com foco em usabilidade, performance e estética.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  👤  DESENVOLVIDO POR
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-       ricinus
-
-  Todo o código, arquitetura, lógica de detecção de
-  dispositivos, interface e sistema de instalação
-  automática foram projetados e implementados por ricinus.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  🛠️  TECNOLOGIAS UTILIZADAS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-   • Python 3.x          — linguagem principal
-   • Tkinter / ttk        — interface gráfica nativa
-   • python-nmap          — wrapper para o nmap
-   • nmap                 — scanner de portas e SO
-   • mac-vendor-lookup    — resolução de fabricantes por MAC
-   • ThreadPoolExecutor   — scan paralelo de alta performance
-   • ARP / NetBIOS        — detecção de MACs e nomes Windows
-   • socket / subprocess  — comunicação de baixo nível
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  📋  LICENÇA
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-   Uso pessoal e educacional. Distribuição e modificação
-   são permitidas mantendo os créditos ao autor original.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ℹ️  VERSÃO
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-   Versão: {APP_VERSION}
-   Python:  {sys.version.split()[0]}
-   nmap:    {"disponível ✔" if HAS_NMAP else "não instalado ✘"}
-   mac-lookup: {"disponível ✔" if HAS_MAC else "não instalado ✘"}
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -695,6 +694,85 @@ class AdvancedIPScannerApp(tk.Tk):
         self._detect_network()
         self.after(100, self._poll_results)
 
+        # verifica atualizações em background ao iniciar
+        threading.Thread(target=self._auto_check_updates, daemon=True).start()
+
+    # ── verificação de atualizações ──────────────────────────────────────────
+    def _auto_check_updates(self):
+        """Roda em background; notifica apenas se houver update disponível."""
+        has_update, latest, url, error = check_for_updates(timeout=8)
+        if has_update:
+            self.after(0, lambda: self._notify_update(latest, url))
+
+    def _notify_update(self, latest, url):
+        """Banner discreto na status bar + diálogo opcional."""
+        self._status_var.set(
+            f"🔔  Nova versão disponível: v{latest}  —  Ajuda → Verificar atualizações"
+        )
+        # muda cor da status bar para chamar atenção
+        for w in self.winfo_children():
+            pass  # já atualizado via StringVar
+
+    def _check_updates_manual(self):
+        """Chamado pelo menu — abre janela com resultado."""
+        win = tk.Toplevel(self)
+        win.title("Verificar atualizações")
+        win.geometry("500x260")
+        win.resizable(False, False)
+        win.configure(bg=BG_DARK)
+        win.grab_set()
+
+        tk.Label(win, text="🔍  Verificando atualizações…",
+                 bg=BG_DARK, fg=FG_ACCENT, font=FONT_TITLE).pack(pady=(24,8))
+
+        msg_var = tk.StringVar(value="Conectando ao GitHub…")
+        msg_lbl = tk.Label(win, textvariable=msg_var, bg=BG_DARK,
+                           fg=FG_DIM, font=FONT_BODY, wraplength=440, justify="center")
+        msg_lbl.pack(pady=6, padx=20)
+
+        ver_lbl = tk.Label(win, text="", bg=BG_DARK, fg=FG_GREEN,
+                           font=FONT_BOLD)
+        ver_lbl.pack(pady=4)
+
+        link_var = tk.StringVar(value="")
+        link_lbl = tk.Label(win, textvariable=link_var, bg=BG_DARK,
+                            fg=FG_ACCENT, font=FONT_BODY, cursor="hand2",
+                            underline=True)
+        link_lbl.pack(pady=2)
+        link_lbl.bind("<Button-1>", lambda e, u=GITHUB_REPO_URL: webbrowser.open(u))
+
+        btn_frame = tk.Frame(win, bg=BG_DARK)
+        btn_frame.pack(pady=16)
+        ttk.Button(btn_frame, text="Fechar", style="Small.TButton",
+                   command=win.destroy).pack()
+
+        def _do_check():
+            has_update, latest, url, error = check_for_updates(timeout=10)
+            def _update_ui():
+                if error and not has_update:
+                    msg_var.set(f"Não foi possível verificar: {error}")
+                    msg_lbl.config(fg=FG_RED)
+                    ver_lbl.config(text=f"Versão atual: v{APP_VERSION}", fg=FG_DIM)
+                elif has_update:
+                    msg_var.set(
+                        f"Nova versão disponível! Sua versão: v{APP_VERSION}"
+                    )
+                    msg_lbl.config(fg=FG_YELLOW)
+                    ver_lbl.config(text=f"Versão disponível: v{latest} ✨", fg=FG_GREEN)
+                    link_var.set(f"🌐  Baixar em: {url}")
+                    link_lbl.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+                else:
+                    msg_var.set("Você já está usando a versão mais recente!")
+                    msg_lbl.config(fg=FG_GREEN)
+                    ver_lbl.config(text=f"Versão atual: v{APP_VERSION} ✔", fg=FG_GREEN)
+                    link_var.set(f"Repositório: {GITHUB_REPO_URL}")
+                    link_lbl.bind("<Button-1>",
+                                  lambda e: webbrowser.open(GITHUB_REPO_URL))
+            win.after(0, _update_ui)
+
+        threading.Thread(target=_do_check, daemon=True).start()
+
+    # ── setup estilo ─────────────────────────────────────────────────────────
     def _setup_style(self):
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -783,9 +861,12 @@ class AdvancedIPScannerApp(tk.Tk):
                          activebackground=BG_SELECT, activeforeground=FG_PRIMARY)
         m_help.add_command(label="📖  Como usar (Guia completo)", command=self._show_help)
         m_help.add_separator()
+        m_help.add_command(label="🔔  Verificar atualizações",    command=self._check_updates_manual)
+        m_help.add_command(label="🌐  Ver repositório no GitHub", command=lambda: webbrowser.open(GITHUB_REPO_URL))
+        m_help.add_separator()
         m_help.add_command(label="🔁  Reinstalar dependências",   command=self._reinstall_deps)
         m_help.add_separator()
-        m_help.add_command(label=f"⭐  Sobre / Créditos",         command=self._show_about)
+        m_help.add_command(label="⭐  Sobre / Créditos",          command=self._show_about)
 
         mb.add_cascade(label="Arquivo",  menu=m_file)
         mb.add_cascade(label="Scan",     menu=m_scan)
@@ -922,7 +1003,6 @@ class AdvancedIPScannerApp(tk.Tk):
         bar.pack(fill="x", side="bottom")
         bar.pack_propagate(False)
 
-        # crédito discreto no canto esquerdo
         tk.Label(bar, text=f"  {APP_TITLE} {APP_VERSION} by {APP_AUTHOR}",
                  bg=BG_LIGHT, fg="#3a4055", font=FONT_BODY,
                  anchor="w").pack(side="left")
@@ -1237,7 +1317,6 @@ class AdvancedIPScannerApp(tk.Tk):
 
     # ── janelas de ajuda / sobre ──────────────────────────────────────────────
     def _show_text_window(self, title, content, width=72, height=36):
-        """Abre janela modal com texto monoespaçado e scrollbar."""
         win = tk.Toplevel(self)
         win.title(title)
         win.configure(bg=BG_DARK)
@@ -1275,13 +1354,50 @@ class AdvancedIPScannerApp(tk.Tk):
                                width=74, height=38)
 
     def _show_about(self):
-        self._show_text_window(f"⭐  Sobre / Créditos — {APP_TITLE}", ABOUT_TEXT,
+        about = f"""
+╔══════════════════════════════════════════════════════════════╗
+║              Advanced IP Scanner {APP_VERSION} — Linux                ║
+╚══════════════════════════════════════════════════════════════╝
+
+  Clone do Advanced IP Scanner para Linux, desenvolvido
+  com foco em usabilidade, performance e estética.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  👤  DESENVOLVIDO POR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+       ricinus
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🛠️  TECNOLOGIAS UTILIZADAS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   • Python 3.x          — linguagem principal
+   • Tkinter / ttk        — interface gráfica nativa
+   • python-nmap          — wrapper para o nmap
+   • nmap                 — scanner de portas e SO
+   • mac-vendor-lookup    — resolução de fabricantes por MAC
+   • ThreadPoolExecutor   — scan paralelo de alta performance
+   • urllib               — verificação de atualizações (GitHub)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ℹ️  VERSÃO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   Versão:     {APP_VERSION}
+   Python:     {sys.version.split()[0]}
+   nmap:       {"disponível ✔" if HAS_NMAP else "não instalado ✘"}
+   mac-lookup: {"disponível ✔" if HAS_MAC else "não instalado ✘"}
+   Repositório: {GITHUB_REPO_URL}
+"""
+        self._show_text_window(f"⭐  Sobre / Créditos — {APP_TITLE}", about,
                                width=66, height=32)
 
     def _reinstall_deps(self):
         if messagebox.askyesno(
             "Reinstalar dependências",
-            "Isso irá apagar o marcador de instalação e reiniciar\no processo de instalação de dependências.\n\nDeseja continuar?"
+            "Isso irá apagar o marcador de instalação e reiniciar\n"
+            "o processo de instalação de dependências.\n\nDeseja continuar?"
         ):
             _MARKER.unlink(missing_ok=True)
             messagebox.showinfo(
