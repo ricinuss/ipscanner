@@ -458,6 +458,66 @@ def scan_ports_simple(ip, timeout=0.4):
     open_svcs.sort(key=lambda x: x[0])
     return open_svcs
 
+def http_banner(ip, port=80, timeout=2.0):
+    """
+    Faz uma requisição HTTP mínima e retorna o título da página + cabeçalho Server.
+    Usado como fingerprint quando vendor/hostname estão vazios.
+    Retorna string vazia em caso de falha.
+    """
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+        s.sendall(
+            f"GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: IPScanner/2\r\n\r\n"
+            .encode()
+        )
+        raw = b""
+        s.settimeout(timeout)
+        while len(raw) < 4096:
+            chunk = s.recv(1024)
+            if not chunk:
+                break
+            raw += chunk
+        s.close()
+        text = raw.decode("utf-8", errors="ignore")
+        parts = []
+        # Server header
+        m = re.search(r"(?i)^Server:\s*(.+)$", text, re.MULTILINE)
+        if m:
+            parts.append(m.group(1).strip())
+        # <title>
+        m = re.search(r"(?i)<title[^>]*>([^<]{1,120})</title>", text)
+        if m:
+            parts.append(m.group(1).strip())
+        return " ".join(parts)
+    except Exception:
+        return ""
+
+# Padrões para fingerprint via banner HTTP (title + Server header)
+HTTP_BANNER_HINTS = [
+    (r"(?i)(tp.?link|tplink)",                 "🔀", "Switch/Roteador TP-Link",   FG_TEAL),
+    (r"(?i)(mikrotik|routeros)",                "🔀", "MikroTik Router",           FG_TEAL),
+    (r"(?i)(ubiquiti|unifi|airmax)",            "📡", "Ubiquiti",                  FG_TEAL),
+    (r"(?i)(cisco)",                            "🔀", "Cisco",                     FG_TEAL),
+    (r"(?i)(asus.*router|asuswrt|merlin)",      "🔀", "ASUS Router",               FG_TEAL),
+    (r"(?i)(d.?link)",                          "🔀", "D-Link",                    FG_TEAL),
+    (r"(?i)(netgear)",                          "🔀", "Netgear",                   FG_TEAL),
+    (r"(?i)(openwrt|luci)",                     "🔀", "Roteador OpenWRT",          FG_TEAL),
+    (r"(?i)(dd.?wrt)",                          "🔀", "Roteador DD-WRT",           FG_TEAL),
+    (r"(?i)(pfsense|opnsense)",                 "🔥", "Firewall pfSense/OPNsense", FG_RED),
+    (r"(?i)(synology|diskstation)",             "🗄️", "Synology NAS",             FG_PURPLE),
+    (r"(?i)(qnap)",                             "🗄️", "QNAP NAS",                 FG_PURPLE),
+    (r"(?i)(hikvision|dahua|axis)",             "📷", "Câmera IP",               FG_YELLOW),
+    (r"(?i)(hp.*printer|jetdirect|laserjet|officejet)", "🖨️", "HP Printer",      FG_ORANGE),
+    (r"(?i)(epson.*print|epsonnet)",            "🖨️", "Epson Printer",           FG_ORANGE),
+    (r"(?i)(canon.*print|pixma|imagerunner)",   "🖨️", "Canon Printer",           FG_ORANGE),
+    (r"(?i)(brother.*print|brother.*mfc)",      "🖨️", "Brother Printer",         FG_ORANGE),
+    (r"(?i)(proxmox)",                          "🖥️", "Proxmox VE",             FG_PURPLE),
+    (r"(?i)(vmware|vsphere|esxi)",              "🖥️", "VMware ESXi",            FG_PURPLE),
+    (r"(?i)(raspberry|raspbian)",               "🍓", "Raspberry Pi",             FG_RED),
+    (r"(?i)(nginx)",                            "🌐", "Servidor Nginx",           FG_GREEN),
+    (r"(?i)(apache)",                           "🌐", "Servidor Apache",          FG_GREEN),
+]
+
 def nmap_scan_full(ip):
     result = {"hostname": "", "os": "", "services": []}
     if not HAS_NMAP:
@@ -502,12 +562,29 @@ def nmap_scan_full(ip):
         pass
     return result
 
-def guess_device(hostname, vendor, services):
-    ports = [p for p, _, _ in services]
-    combined = f"{hostname} {vendor}"
-    for pattern, icon, label, color in DEVICE_HINTS:
-        if re.search(pattern, combined):
-            return icon, label, color
+def guess_device(hostname, vendor, services, banner=""):
+    """
+    Detecta tipo de dispositivo usando:
+    1. hostname + vendor (MAC lookup)  — fonte principal
+    2. banner HTTP (título + Server)   — fallback quando vendor está vazio
+    3. portas abertas                  — fallback final
+    """
+    ports    = [p for p, _, _ in services]
+    combined = f"{hostname} {vendor}".strip()
+
+    # 1) tenta pelos hints de hostname/vendor
+    if combined:
+        for pattern, icon, label, color in DEVICE_HINTS:
+            if re.search(pattern, combined):
+                return icon, label, color
+
+    # 2) tenta pelo banner HTTP — cobre roteadores sem vendor resolvido
+    if banner:
+        for pattern, icon, label, color in HTTP_BANNER_HINTS:
+            if re.search(pattern, banner):
+                return icon, label, color
+
+    # 3) fallback por portas
     if 3389 in ports: return "🖥️", "Windows (RDP)",     FG_ACCENT
     if 445  in ports: return "🖥️", "Windows/Samba",     FG_ACCENT
     if 22   in ports and 80 not in ports:
@@ -526,12 +603,12 @@ def scan_device(ip, advanced=False, stop_event=None):
     alive, latency = ping_host(ip)
     if not alive:
         return None
-    dev.alive   = True
-    dev.latency = latency
+    dev.alive    = True
+    dev.latency  = latency
     dev.hostname = resolve_hostname(ip)
-    dev.mac    = get_mac_arp(ip)
-    dev.vendor = get_vendor(dev.mac)
-    nb = get_netbios_name(ip)
+    dev.mac      = get_mac_arp(ip)
+    dev.vendor   = get_vendor(dev.mac)
+    nb           = get_netbios_name(ip)
     dev.hostname = dev.hostname or nb
     if stop_event and stop_event.is_set():
         return None
@@ -545,7 +622,20 @@ def scan_device(ip, advanced=False, stop_event=None):
             dev.services = scan_ports_simple(ip)
     else:
         dev.services = scan_ports_simple(ip)
-    dev.icon, dev.dtype, dev.color = guess_device(dev.hostname, dev.vendor, dev.services)
+
+    # coleta banner HTTP para fingerprint — só se porta 80 ou 8080 aberta
+    ports = [p for p, _, _ in dev.services]
+    banner = ""
+    if not dev.vendor:   # evita chamada desnecessária quando vendor já resolveu
+        for http_port in (80, 8080, 443, 8443):
+            if http_port in ports:
+                banner = http_banner(ip, http_port)
+                if banner:
+                    break
+
+    dev.icon, dev.dtype, dev.color = guess_device(
+        dev.hostname, dev.vendor, dev.services, banner=banner
+    )
     return dev
 
 # ══════════════════════════════════════════════════════════════════════════════
