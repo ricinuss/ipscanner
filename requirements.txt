@@ -1,0 +1,10 @@
+# Advanced IP Scanner — Dependências Python
+# Instale com: pip install -r requirements.txt
+#
+# Nota: python3-tk deve ser instalado via gerenciador de pacotes do sistema:
+#   Debian/Ubuntu: sudo apt install python3-tk
+#   Fedora:        sudo dnf install python3-tkinter
+#   Arch:          sudo pacman -S tk
+
+python-nmap>=0.7.1
+mac-vendor-lookup>=0.1.12

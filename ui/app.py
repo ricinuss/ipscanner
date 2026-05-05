@@ -6,6 +6,7 @@ Lógica de scan em core/scanner.py | Estilo em ui/style.py
 
 import csv
 import ipaddress
+import logging
 import queue
 import socket
 import threading
@@ -31,6 +32,8 @@ from ui.dialogs import UpdateDialog
 from utils.updater import check_for_updates
 from utils.help_text import HELP_TEXT, get_about_text
 
+logger = logging.getLogger("ipscanner.ui")
+
 
 class AdvancedIPScannerApp(tk.Tk):
     """Janela principal do Advanced IP Scanner."""
@@ -51,14 +54,29 @@ class AdvancedIPScannerApp(tk.Tk):
         self._total_hosts  = 0
         self._scanned      = 0
         self._row_idx      = 0
+        self._sort_reverse: dict[str, bool]    = {}  # toggle ASC/DESC por coluna
 
         ui_style.apply(self)
         self._build_ui()
         self._detect_network()
+        self._bind_shortcuts()
         self.after(100, self._poll_results)
 
         # verifica updates em background
         threading.Thread(target=self._auto_check_updates, daemon=True).start()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  ATALHOS DE TECLADO
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _bind_shortcuts(self):
+        """Registra atalhos de teclado globais."""
+        self.bind("<F5>",           lambda e: self._start_scan())
+        self.bind("<Escape>",       lambda e: self._stop_scan())
+        self.bind("<Control-e>",    lambda e: self._export_csv())
+        self.bind("<Control-E>",    lambda e: self._export_csv())
+        self.bind("<Control-l>",    lambda e: self._clear_results())
+        self.bind("<Control-L>",    lambda e: self._clear_results())
 
     # ══════════════════════════════════════════════════════════════════════════
     #  CONSTRUÇÃO DA UI
@@ -159,10 +177,17 @@ class AdvancedIPScannerApp(tk.Tk):
 
         lbl("Threads:").pack(side="right", padx=(0, 4))
         self._threads_var = tk.IntVar(value=64)
-        tk.Spinbox(bar, from_=8, to=256, increment=8,
-                   textvariable=self._threads_var, width=4,
-                   bg=BG_LIGHT, fg=FG_PRIMARY, buttonbackground=BG_LIGHT,
-                   relief="flat", font=FONT_MONO).pack(side="right", padx=(0, 14))
+        self._threads_spin = tk.Spinbox(
+            bar, from_=8, to=256, increment=8,
+            textvariable=self._threads_var, width=4,
+            bg=BG_LIGHT, fg=FG_PRIMARY, buttonbackground=BG_LIGHT,
+            relief="flat", font=FONT_MONO,
+            validate="key",
+            validatecommand=(
+                self.register(lambda v: v.isdigit() or v == ""), "%P"
+            ),
+        )
+        self._threads_spin.pack(side="right", padx=(0, 14))
 
     def _build_main(self):
         paned = tk.PanedWindow(self, orient="vertical", bg=BORDER,
@@ -269,13 +294,12 @@ class AdvancedIPScannerApp(tk.Tk):
     def _saved_networks(self) -> list[str]:
         nets = []
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
             parts = ip.split(".")
             nets.append(f"{parts[0]}.{parts[1]}.{parts[2]}.0/24")
-        except Exception:
+        except OSError:
             pass
         for n in ["192.168.0.0/24", "192.168.1.0/24",
                   "10.0.0.0/24", "172.16.0.0/24"]:
@@ -306,7 +330,7 @@ class AdvancedIPScannerApp(tk.Tk):
             e = max(s,   min(int(self._ip_end.get()),   254))
             all_hosts = [h for h in all_hosts
                          if s <= int(str(h).split(".")[-1]) <= e]
-        except Exception:
+        except ValueError:
             pass
         return all_hosts
 
@@ -328,7 +352,8 @@ class AdvancedIPScannerApp(tk.Tk):
         self._count_var.set("")
 
         adv     = self._adv_var.get()
-        threads = self._threads_var.get()
+        raw_threads = self._threads_var.get()
+        threads = max(8, min(256, raw_threads))  # clamp para faixa segura
         stop    = self._stop_event
         q       = self._result_queue
 
@@ -386,13 +411,36 @@ class AdvancedIPScannerApp(tk.Tk):
     #  TREEVIEW
     # ══════════════════════════════════════════════════════════════════════════
 
+    def _sorted_ip_index(self, new_ip: str) -> int:
+        """Retorna o índice onde inserir new_ip para manter ordem numérica."""
+        children = self._tree.get_children("")
+        try:
+            new_addr = ipaddress.ip_address(new_ip)
+        except ValueError:
+            return len(children)
+        for i, iid in enumerate(children):
+            vals = self._tree.item(iid, "values")
+            if not vals:
+                continue
+            try:
+                if new_addr < ipaddress.ip_address(vals[0].strip()):
+                    return i
+            except ValueError:
+                continue
+        return len(children)
+
     def _add_device(self, dev: DeviceInfo):
         self._devices[dev.ip] = dev
-        tag = "row_odd" if self._row_idx % 2 else "row_even"
+
+        # Inserir na posição correta (ordem numérica de IP)
+        idx = self._sorted_ip_index(dev.ip)
+
+        # Determina tag de cor com base no índice real na árvore
+        tag = "row_odd" if idx % 2 else "row_even"
         self._row_idx += 1
 
         iid = self._tree.insert(
-            "", "end", text="",
+            "", idx, text="",
             values=(
                 dev.ip,
                 dev.hostname or "—",
@@ -413,6 +461,16 @@ class AdvancedIPScannerApp(tk.Tk):
                 tags=("service",), iid=child)
             self._tree.set(child, "mac", url or "")
         self._tree.see(iid)
+
+    def _reapply_zebra(self):
+        """Recalcula as tags de zebra (odd/even) para todas as linhas de topo."""
+        for i, iid in enumerate(self._tree.get_children("")):
+            current_tags = list(self._tree.item(iid, "tags"))
+            # Remove tags de zebra existentes
+            new_tags = [t for t in current_tags
+                        if t not in ("row_odd", "row_even")]
+            new_tags.insert(0, "row_odd" if i % 2 else "row_even")
+            self._tree.item(iid, tags=tuple(new_tags))
 
     @staticmethod
     def _make_url(ip: str, port: int, scheme: str) -> str:
@@ -438,13 +496,42 @@ class AdvancedIPScannerApp(tk.Tk):
         self._count_var.set("")
 
     def _sort_col(self, col: str):
-        data = [(self._tree.set(k, col), k) for k in self._tree.get_children("")]
-        try:
-            data.sort(key=lambda x: ipaddress.ip_address(x[0]))
-        except Exception:
-            data.sort()
+        """Ordena a coluna clicada com toggle ASC/DESC; recalcula zebra."""
+        # Toggle direção
+        reverse = self._sort_reverse.get(col, False)
+        self._sort_reverse[col] = not reverse
+
+        # Coleta apenas nós de topo (dispositivos, não serviços-filhos)
+        top_items = self._tree.get_children("")
+        data = [(self._tree.set(k, col), k) for k in top_items]
+        if col == "ip":
+            try:
+                data.sort(key=lambda x: ipaddress.ip_address(x[0].strip()),
+                          reverse=reverse)
+            except Exception:
+                data.sort(reverse=reverse)
+        elif col == "ping":
+            def ping_key(x):
+                try:
+                    return float(x[0])
+                except Exception:
+                    return float("inf")
+            data.sort(key=ping_key, reverse=reverse)
+        else:
+            data.sort(key=lambda x: x[0].lower(), reverse=reverse)
         for i, (_, k) in enumerate(data):
             self._tree.move(k, "", i)
+        self._reapply_zebra()
+
+        # Indicador visual na coluna
+        arrow = " ▲" if not reverse else " ▼"
+        col_headings = {
+            "ip": "Endereço IP", "name": "Nome", "mac": "Endereço MAC",
+            "vendor": "Fabricante", "dtype": "Tipo", "os": "Sistema Op.",
+            "ping": "Ping (ms)",
+        }
+        for c, text in col_headings.items():
+            self._tree.heading(c, text=text + (arrow if c == col else ""))
 
     # ══════════════════════════════════════════════════════════════════════════
     #  EVENTOS
@@ -488,7 +575,10 @@ class AdvancedIPScannerApp(tk.Tk):
             return
         self._tree.selection_set(iid)
         parent = self._tree.parent(iid)
-        ip  = self._tree.item(parent or iid, "values")[0].strip()
+        vals = self._tree.item(parent or iid, "values")
+        if not vals:
+            return
+        ip  = vals[0].strip()
         dev = self._devices.get(ip)
 
         MN = dict(bg=BG_MID, fg=FG_PRIMARY,
@@ -581,15 +671,16 @@ class AdvancedIPScannerApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _update_device(self, dev: DeviceInfo):
-        old = self._tree_ids.get(dev.ip)
-        if old:
+        old_iid = self._tree_ids.get(dev.ip)
+        if old_iid:
             try:
-                self._tree.delete(old)
+                self._tree.delete(old_iid)
             except Exception:
                 pass
         self._devices.pop(dev.ip, None)
         self._tree_ids.pop(dev.ip, None)
         self._add_device(dev)
+        self._reapply_zebra()
 
     def _export_csv(self):
         path = filedialog.asksaveasfilename(

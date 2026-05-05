@@ -46,6 +46,9 @@ def _version_gt(v1: str, v2: str) -> bool:
     try:
         def parts(v):
             return [int(x) for x in re.split(r"[.\-]", v) if x.isdigit()]
-        return parts(v1) > parts(v2)
+        p1, p2 = parts(v1), parts(v2)
+        if not p1 or not p2:
+            return False  # não conseguiu parsear → sem update
+        return p1 > p2
     except Exception:
-        return v1 != v2
+        return False  # em caso de erro, não sinalizar update falso

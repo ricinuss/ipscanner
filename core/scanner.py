@@ -5,9 +5,11 @@ Para adicionar um novo método de detecção, adicione uma função aqui
 e chame-a em scan_device().
 """
 
+import logging
 import re
 import os
 import socket
+import ssl
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +18,8 @@ from core.constants import (
     COMMON_PORTS, DEVICE_HINTS, HTTP_BANNER_HINTS,
     FG_DIM, FG_ACCENT, FG_GREEN, FG_YELLOW, FG_ORANGE, FG_PRIMARY,
 )
+
+logger = logging.getLogger("ipscanner.scanner")
 
 # ── imports opcionais ─────────────────────────────────────────────────────────
 try:
@@ -61,36 +65,46 @@ class DeviceInfo:
 
 def get_local_network() -> str:
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
         parts = ip.split(".")
         return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
-    except Exception:
+    except OSError as e:
+        logger.debug("Não foi possível detectar rede local: %s", e)
         return "192.168.1.0/24"
 
 
 def ping_host(ip: str, timeout: float = 1.0) -> tuple[bool, float]:
     t0 = time.time()
     try:
+        # -W espera segundos na maioria das distros Linux (iputils)
         r = subprocess.run(
-            ["ping", "-c", "1", "-W", str(int(timeout * 1000)), ip],
+            ["ping", "-c", "1", "-W", str(max(1, int(timeout))), ip],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=timeout + 0.5,
+            timeout=timeout + 1.5,
         )
         latency = (time.time() - t0) * 1000
         return r.returncode == 0, round(latency, 1)
-    except Exception:
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.debug("Ping falhou para %s: %s", ip, e)
         return False, 0.0
 
 
 def resolve_hostname(ip: str) -> str:
+    """Resolve hostname via subprocess (thread-safe — sem alterar estado global)."""
     try:
-        socket.setdefaulttimeout(1)
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return ""
+        result = subprocess.run(
+            ["getent", "hosts", ip],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split()
+            if len(parts) >= 2:
+                return parts[1]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.debug("Resolução de hostname falhou para %s: %s", ip, e)
+    return ""
 
 
 def get_netbios_name(ip: str) -> str:
@@ -111,13 +125,13 @@ def get_netbios_name(ip: str) -> str:
 def get_mac_arp(ip: str) -> str:
     try:
         out = subprocess.check_output(
-            ["arp", "-n", ip], stderr=subprocess.DEVNULL
+            ["arp", "-n", ip], stderr=subprocess.DEVNULL, timeout=3,
         ).decode()
         m = re.search(r"([0-9a-f]{2}[:\-]){5}[0-9a-f]{2}", out, re.IGNORECASE)
         if m:
             return m.group(0).upper()
-    except Exception:
-        pass
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as e:
+        logger.debug("ARP falhou para %s: %s", ip, e)
     return ""
 
 
@@ -126,7 +140,8 @@ def get_vendor(mac: str) -> str:
         return ""
     try:
         return _mac_lookup.lookup(mac)
-    except Exception:
+    except Exception as e:
+        logger.debug("Vendor lookup falhou para %s: %s", mac, e)
         return ""
 
 
@@ -134,18 +149,23 @@ def get_vendor(mac: str) -> str:
 #  SCAN DE PORTAS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def scan_ports_simple(ip: str, timeout: float = 0.4) -> list[tuple[int, str, str]]:
+def scan_ports_simple(ip: str, timeout: float = 0.4,
+                      stop_event=None) -> list[tuple[int, str, str]]:
     """Scan rápido nas portas de COMMON_PORTS via socket."""
     def try_port(port):
+        if stop_event and stop_event.is_set():
+            return None
         try:
             with socket.create_connection((ip, port), timeout=timeout):
                 return port
-        except Exception:
+        except (OSError, socket.error):
             return None
 
     open_svcs = []
     with ThreadPoolExecutor(max_workers=20) as ex:
         for port in ex.map(try_port, list(COMMON_PORTS.keys())):
+            if stop_event and stop_event.is_set():
+                break
             if port:
                 name, icon, scheme = COMMON_PORTS[port]
                 open_svcs.append((port, f"{icon} {name}", scheme))
@@ -154,21 +174,28 @@ def scan_ports_simple(ip: str, timeout: float = 0.4) -> list[tuple[int, str, str
 
 
 def http_banner(ip: str, port: int = 80, timeout: float = 2.0) -> str:
-    """Coleta Server header e <title> via HTTP simples para fingerprint."""
+    """Coleta Server header, <title> e corpo inicial via HTTP/HTTPS para fingerprint."""
     try:
-        s = socket.create_connection((ip, port), timeout=timeout)
-        s.sendall(
-            f"GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: IPScanner/2\r\n\r\n"
-            .encode()
-        )
-        raw = b""
-        s.settimeout(timeout)
-        while len(raw) < 4096:
-            chunk = s.recv(1024)
-            if not chunk:
-                break
-            raw += chunk
-        s.close()
+        with socket.create_connection((ip, port), timeout=timeout) as s:
+            # Wrap com TLS para portas HTTPS
+            if port in (443, 8443):
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                s = ctx.wrap_socket(s, server_hostname=ip)
+
+            s.sendall(
+                f"GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: IPScanner/2\r\n\r\n"
+                .encode()
+            )
+            raw = b""
+            s.settimeout(timeout)
+            while len(raw) < 8192:
+                chunk = s.recv(2048)
+                if not chunk:
+                    break
+                raw += chunk
+
         text = raw.decode("utf-8", errors="ignore")
         parts = []
         m = re.search(r"(?i)^Server:\s*(.+)$", text, re.MULTILINE)
@@ -177,8 +204,14 @@ def http_banner(ip: str, port: int = 80, timeout: float = 2.0) -> str:
         m = re.search(r"(?i)<title[^>]*>([^<]{1,120})</title>", text)
         if m:
             parts.append(m.group(1).strip())
+        # Inclui trecho do corpo para capturar assets/paths exclusivos de dispositivos
+        # (ex: 'steel_gray', 'jquery.cookie.min' nos switches TP-Link Easy Smart)
+        body_start = text.find("\r\n\r\n")
+        if body_start != -1:
+            parts.append(text[body_start:body_start + 2048])
         return " ".join(parts)
-    except Exception:
+    except (OSError, socket.error, ssl.SSLError) as e:
+        logger.debug("Banner HTTP falhou para %s:%d: %s", ip, port, e)
         return ""
 
 
@@ -224,8 +257,8 @@ def nmap_scan_full(ip: str) -> dict:
                     _, icon, scheme = COMMON_PORTS[port]
                 result["services"].append((port, f"{icon} {label}", scheme))
         result["services"].sort(key=lambda x: x[0])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Nmap scan falhou para %s: %s", ip, e)
     return result
 
 
@@ -299,19 +332,19 @@ def scan_device(ip: str, advanced: bool = False,
         nm = nmap_scan_full(ip)
         dev.hostname = dev.hostname or nm["hostname"]
         dev.os       = nm["os"]
-        dev.services = nm["services"] if nm["services"] else scan_ports_simple(ip)
+        dev.services = nm["services"] if nm["services"] else scan_ports_simple(
+            ip, stop_event=stop_event)
     else:
-        dev.services = scan_ports_simple(ip)
+        dev.services = scan_ports_simple(ip, stop_event=stop_event)
 
-    # banner HTTP — só quando vendor não foi resolvido
+    # banner HTTP — sempre coletado quando disponível para melhor fingerprint
     banner = ""
-    if not dev.vendor:
-        ports = [p for p, _, _ in dev.services]
-        for http_port in (80, 8080, 443, 8443):
-            if http_port in ports:
-                banner = http_banner(ip, http_port)
-                if banner:
-                    break
+    ports = [p for p, _, _ in dev.services]
+    for http_port in (80, 8080, 443, 8443):
+        if http_port in ports:
+            banner = http_banner(ip, http_port)
+            if banner:
+                break
 
     dev.icon, dev.dtype, dev.color = guess_device(
         dev.hostname, dev.vendor, dev.services, banner=banner

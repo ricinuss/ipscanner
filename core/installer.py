@@ -124,6 +124,7 @@ def _mark_installed():
 def _run_installer_window():
     import tkinter as tk
     from tkinter import ttk
+    import queue as q
 
     root = tk.Tk()
     root.title("Advanced IP Scanner — Configuração Inicial")
@@ -151,42 +152,58 @@ def _run_installer_window():
     tk.Label(root, textvariable=status_var, bg="#1a1d23", fg="#66bb6a",
              font=("monospace", 9)).pack()
 
-    def log(msg):
-        log_box.config(state="normal")
-        log_box.insert("end", msg + "\n")
-        log_box.see("end")
-        log_box.config(state="disabled")
-        root.update_idletasks()
+    msg_queue = q.Queue()
+
+    def _flush_queue():
+        """Drena a fila de mensagens na main thread (thread-safe)."""
+        while not msg_queue.empty():
+            kind, text = msg_queue.get_nowait()
+            if kind == "log":
+                log_box.config(state="normal")
+                log_box.insert("end", text + "\n")
+                log_box.see("end")
+                log_box.config(state="disabled")
+            elif kind == "status":
+                status_var.set(text)
+            elif kind == "done":
+                pbar.stop()
+                status_var.set("Concluído! Abrindo o scanner…")
+                log_box.config(state="normal")
+                log_box.insert("end", "\n✅ Tudo pronto!\n")
+                log_box.see("end")
+                log_box.config(state="disabled")
+                root.after(1800, root.destroy)
+                return
+        root.after(100, _flush_queue)
 
     def run_install():
         pbar.start(12)
         distro, mgr = _detect_distro()
-        log(f"► Distribuição: {distro.upper()} ({mgr or 'desconhecido'})")
+        msg_queue.put(("log", f"► Distribuição: {distro.upper()} ({mgr or 'desconhecido'})"))
 
-        status_var.set("Instalando pacotes do sistema…")
-        log("► Instalando nmap, python3-tk, pip…")
-        _install_system_deps(distro, mgr, log=log)
+        msg_queue.put(("status", "Instalando pacotes do sistema…"))
+        msg_queue.put(("log", "► Instalando nmap, python3-tk, pip…"))
+        _install_system_deps(distro, mgr,
+                             log=lambda m: msg_queue.put(("log", m)))
 
         for pkg in PIP_PACKAGES:
-            status_var.set(f"Instalando {pkg}…")
-            log(f"► Instalando {pkg}…")
+            msg_queue.put(("status", f"Instalando {pkg}…"))
+            msg_queue.put(("log", f"► Instalando {pkg}…"))
             try:
                 _pip_install(pkg)
-                log(f"✔ {pkg} instalado.")
+                msg_queue.put(("log", f"✔ {pkg} instalado."))
             except Exception as e:
-                log(f"⚠ Erro ao instalar {pkg}: {e}")
+                msg_queue.put(("log", f"⚠ Erro ao instalar {pkg}: {e}"))
 
-        status_var.set("Atualizando base de fabricantes (MAC)…")
-        log("► Atualizando base de MACs (timeout: 15s)…")
+        msg_queue.put(("status", "Atualizando base de fabricantes (MAC)…"))
+        msg_queue.put(("log", "► Atualizando base de MACs (timeout: 15s)…"))
         ok, msg = _update_mac_vendors(timeout_sec=15)
-        log(msg)
+        msg_queue.put(("log", msg))
 
         _mark_installed()
-        pbar.stop()
-        status_var.set("Concluído! Abrindo o scanner…")
-        log("\n✅ Tudo pronto!")
-        root.after(1800, root.destroy)
+        msg_queue.put(("done", ""))
 
+    root.after(100, _flush_queue)
     root.after(300,
                lambda: threading.Thread(target=run_install, daemon=True).start())
     root.mainloop()

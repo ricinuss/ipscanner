@@ -58,6 +58,7 @@ COMMON_PORTS: dict[int, tuple[str, str, str]] = {
     110:  ("POP3",      "📧",  ""),
     139:  ("NetBIOS",   "🪟",  ""),
     143:  ("IMAP",      "📧",  ""),
+    161:  ("SNMP",      "📊",  ""),
     443:  ("HTTPS",     "🔒",  "https"),
     445:  ("SMB",       "🪟",  ""),
     515:  ("Printer",   "🖨️", ""),
@@ -104,26 +105,45 @@ DEVICE_HINTS = [
 
 # ── hints por banner HTTP ─────────────────────────────────────────────────────
 HTTP_BANNER_HINTS = [
-    (r"(?i)(tp.?link|tplink)",                 "🔀", "Switch/Roteador TP-Link",   FG_TEAL),
-    (r"(?i)(mikrotik|routeros)",               "🔀", "MikroTik Router",           FG_TEAL),
-    (r"(?i)(ubiquiti|unifi|airmax)",           "📡", "Ubiquiti",                  FG_TEAL),
-    (r"(?i)(cisco)",                           "🔀", "Cisco",                     FG_TEAL),
-    (r"(?i)(asus.*router|asuswrt|merlin)",     "🔀", "ASUS Router",               FG_TEAL),
-    (r"(?i)(d.?link)",                         "🔀", "D-Link",                    FG_TEAL),
-    (r"(?i)(netgear)",                         "🔀", "Netgear",                   FG_TEAL),
-    (r"(?i)(openwrt|luci)",                    "🔀", "Roteador OpenWRT",          FG_TEAL),
-    (r"(?i)(dd.?wrt)",                         "🔀", "Roteador DD-WRT",           FG_TEAL),
-    (r"(?i)(pfsense|opnsense)",                "🔥", "Firewall pfSense/OPNsense", FG_RED),
-    (r"(?i)(synology|diskstation)",            "🗄️", "Synology NAS",             FG_PURPLE),
-    (r"(?i)(qnap)",                            "🗄️", "QNAP NAS",                 FG_PURPLE),
-    (r"(?i)(hikvision|dahua|axis)",            "📷", "Câmera IP",               FG_YELLOW),
-    (r"(?i)(hp.*printer|jetdirect|laserjet|officejet)", "🖨️", "HP Printer",     FG_ORANGE),
-    (r"(?i)(epson.*print|epsonnet)",           "🖨️", "Epson Printer",           FG_ORANGE),
-    (r"(?i)(canon.*print|pixma|imagerunner)",  "🖨️", "Canon Printer",           FG_ORANGE),
-    (r"(?i)(brother.*print|brother.*mfc)",     "🖨️", "Brother Printer",         FG_ORANGE),
-    (r"(?i)(proxmox)",                         "🖥️", "Proxmox VE",             FG_PURPLE),
-    (r"(?i)(vmware|vsphere|esxi)",             "🖥️", "VMware ESXi",            FG_PURPLE),
-    (r"(?i)(raspberry|raspbian)",              "🍓", "Raspberry Pi",             FG_RED),
-    (r"(?i)(nginx)",                           "🌐", "Servidor Nginx",           FG_GREEN),
-    (r"(?i)(apache)",                          "🌐", "Servidor Apache",          FG_GREEN),
+    # ── TP-Link: identificadores únicos dos switches Easy Smart ────────────────
+    # Server header exato retornado por switches TL-SG / TL-SF
+    (r"(?i)\bweb switch\b",                                "🔀", "Switch TP-Link (Easy Smart)", FG_TEAL),
+    # Tema CSS / asset exclusivo da interface web TP-Link Easy Smart
+    (r"(?i)(steel_gray|jquery\.cookie\.min)",              "🔀", "Switch TP-Link (Easy Smart)", FG_TEAL),
+    # ── TP-Link: nome explícito OU modelos de switch/roteador ─────────────────
+    (r"(?i)(tp.?link|tplink)",                             "🔀", "Switch/Roteador TP-Link",   FG_TEAL),
+    # Modelos de switch gerenciado TP-Link (TL-SG, TL-SF, TL-SL)
+    (r"(?i)(TL-S[GLF][0-9])",                              "🔀", "Switch TP-Link",            FG_TEAL),
+    # Switch Easy Smart / Smart Switch (interface web padrão TP-Link)
+    (r"(?i)(easy.?smart|smart.?switch)",                   "🔀", "Switch TP-Link (Smart)",    FG_TEAL),
+    # Interface Omada (TP-Link SDN / Access Points e switches ent. empresa)
+    (r"(?i)(omada)",                                       "📡", "TP-Link Omada",             FG_TEAL),
+
+    # ── Outros fabricantes de rede ────────────────────────────────────────────
+    (r"(?i)(mikrotik|routeros)",                          "🔀", "MikroTik Router",           FG_TEAL),
+    (r"(?i)(ubiquiti|unifi|airmax|edgeos)",               "📡", "Ubiquiti",                  FG_TEAL),
+    (r"(?i)(cisco)",                                      "🔀", "Cisco",                     FG_TEAL),
+    (r"(?i)(asus.*router|asuswrt|merlin)",                "🔀", "ASUS Router",               FG_TEAL),
+    (r"(?i)(d.?link)",                                    "🔀", "D-Link",                    FG_TEAL),
+    (r"(?i)(netgear)",                                    "🔀", "Netgear",                   FG_TEAL),
+    (r"(?i)(openwrt|luci)",                               "🔀", "Roteador OpenWRT",          FG_TEAL),
+    (r"(?i)(dd.?wrt)",                                    "🔀", "Roteador DD-WRT",           FG_TEAL),
+    (r"(?i)(pfsense|opnsense)",                           "🔥", "Firewall pfSense/OPNsense", FG_RED),
+    # ── NAS ───────────────────────────────────────────────────────────────────
+    (r"(?i)(synology|diskstation)",                       "🗄️", "Synology NAS",             FG_PURPLE),
+    (r"(?i)(qnap)",                                       "🗄️", "QNAP NAS",                 FG_PURPLE),
+    # ── Câmeras ───────────────────────────────────────────────────────────────
+    (r"(?i)(hikvision|dahua|axis)",                       "📷", "Câmera IP",               FG_YELLOW),
+    # ── Impressoras ───────────────────────────────────────────────────────────
+    (r"(?i)(hp.*printer|jetdirect|laserjet|officejet)",   "🖨️", "HP Printer",     FG_ORANGE),
+    (r"(?i)(epson.*print|epsonnet)",                      "🖨️", "Epson Printer",           FG_ORANGE),
+    (r"(?i)(canon.*print|pixma|imagerunner)",              "🖨️", "Canon Printer",           FG_ORANGE),
+    (r"(?i)(brother.*print|brother.*mfc)",                "🖨️", "Brother Printer",         FG_ORANGE),
+    # ── Servidores de virtualização ────────────────────────────────────────────
+    (r"(?i)(proxmox)",                                    "🖥️", "Proxmox VE",             FG_PURPLE),
+    (r"(?i)(vmware|vsphere|esxi)",                        "🖥️", "VMware ESXi",            FG_PURPLE),
+    (r"(?i)(raspberry|raspbian)",                         "🍓", "Raspberry Pi",             FG_RED),
+    # ── Servidores web ────────────────────────────────────────────────────────
+    (r"(?i)(nginx)",                                      "🌐", "Servidor Nginx",           FG_GREEN),
+    (r"(?i)(apache)",                                     "🌐", "Servidor Apache",          FG_GREEN),
 ]
