@@ -7,7 +7,7 @@ Para personalizar a aparência, edite apenas este arquivo.
 import sys
 
 # ── versão e repositório ──────────────────────────────────────────────────────
-APP_VERSION    = "2.2"
+APP_VERSION    = "2.5"
 APP_TITLE      = "Advanced IP Scanner"
 APP_AUTHOR     = "ricinus"
 GITHUB_REPO    = "ricinuss/ipscanner"
